@@ -9,7 +9,9 @@ import { env, hasGoogleOAuthConfig, hasSheetsConfig } from "@/lib/system/env";
 export default async function SettingsPage() {
   const session = await getSession();
   if (!session) redirect("/");
-  const syncState = await getLeadRepository().getSyncState(session.email);
+  const syncState = await getLeadRepository()
+    .getSyncState(session.email)
+    .catch(() => null);
 
   return (
     <AppShell session={session}>

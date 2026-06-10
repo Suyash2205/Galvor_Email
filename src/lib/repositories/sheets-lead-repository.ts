@@ -9,15 +9,16 @@ import { env } from "@/lib/system/env";
 type Row = Record<string, string>;
 
 const trackerTabs = ["Tracker", "Positiv Leads"] as const;
+let schemaEnsuredAt = 0;
+let schemaEnsurePromise: Promise<void> | null = null;
+const schemaTtlMs = 10 * 60 * 1000;
 
 export class SheetsLeadRepository implements LeadRepository {
   private sheets = getSheetsClient();
   private spreadsheetId = getSpreadsheetId();
 
   async getLeads(filters: LeadFilters): Promise<Lead[]> {
-    await this.ensureSchema();
-    const rows = await this.readRows("Tracker");
-    const positiveRows = await this.readRows("Positiv Leads");
+    const [rows, positiveRows] = await this.readRowsMany(["Tracker", "Positiv Leads"]);
     const merged = [...rows, ...positiveRows]
       .map(rowToLead)
       .filter((lead): lead is Lead => Boolean(lead))
@@ -168,6 +169,17 @@ export class SheetsLeadRepository implements LeadRepository {
   }
 
   private async ensureSchema() {
+    if (Date.now() - schemaEnsuredAt < schemaTtlMs) return;
+    if (schemaEnsurePromise) return schemaEnsurePromise;
+
+    schemaEnsurePromise = this.ensureSchemaInternal().finally(() => {
+      schemaEnsurePromise = null;
+    });
+
+    return schemaEnsurePromise;
+  }
+
+  private async ensureSchemaInternal() {
     const metadata = await this.sheets.spreadsheets.get({
       spreadsheetId: this.spreadsheetId,
     });
@@ -195,6 +207,8 @@ export class SheetsLeadRepository implements LeadRepository {
       this.ensureColumns("Email Threads", emailThreadColumns),
       this.ensureColumns("_System", systemColumns),
     ]);
+
+    schemaEnsuredAt = Date.now();
   }
 
   private async ensureColumns(tab: string, requiredColumns: readonly string[]) {
@@ -220,6 +234,19 @@ export class SheetsLeadRepository implements LeadRepository {
   private async readRows(tab: string): Promise<Row[]> {
     const sheet = await this.getSheet(tab);
     return sheet.rows;
+  }
+
+  private async readRowsMany(tabs: string[]): Promise<Row[][]> {
+    const response = await this.sheets.spreadsheets.values.batchGet({
+      spreadsheetId: this.spreadsheetId,
+      ranges: tabs.map((tab) => `${quoteTab(tab)}!A:AZ`),
+    });
+
+    return tabs.map((_, index) => {
+      const values = (response.data.valueRanges?.[index]?.values as string[][] | undefined) ?? [];
+      const headers = values[0] ?? [];
+      return values.slice(1).map((cells) => cellsToRow(headers, cells));
+    });
   }
 
   private async readHeaders(tab: string): Promise<string[]> {

@@ -17,12 +17,7 @@ export default async function LeadsPage({ searchParams }: LeadsPageProps) {
   const session = await getSession();
   if (!session) redirect("/");
   const params = await searchParams;
-  const leads = await getLeadRepository().getLeads({
-    connectedInbox: session.email,
-    search: params.search,
-    stage: params.stage,
-    interestSignal: parseInterest(params.interest),
-  });
+  const { leads, error } = await loadLeads(session.email, params);
 
   return (
     <AppShell session={session}>
@@ -37,6 +32,11 @@ export default async function LeadsPage({ searchParams }: LeadsPageProps) {
           {leads.length} lead{leads.length === 1 ? "" : "s"}
         </div>
       </div>
+      {error ? (
+        <div className="mb-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          {error}
+        </div>
+      ) : null}
       <LeadInbox
         leads={leads}
         search={params.search}
@@ -45,6 +45,27 @@ export default async function LeadsPage({ searchParams }: LeadsPageProps) {
       />
     </AppShell>
   );
+}
+
+async function loadLeads(
+  connectedInbox: string,
+  params: { search?: string; stage?: string; interest?: string },
+) {
+  try {
+    const leads = await getLeadRepository().getLeads({
+      connectedInbox,
+      search: params.search,
+      stage: params.stage,
+      interestSignal: parseInterest(params.interest),
+    });
+    return { leads, error: "" };
+  } catch (error) {
+    const message =
+      error instanceof Error && error.message.includes("Quota exceeded")
+        ? "Google Sheets is temporarily rate-limiting reads. Wait a minute and refresh."
+        : "Could not load leads from Google Sheets right now.";
+    return { leads: [], error: message };
+  }
 }
 
 function parseInterest(value?: string): InterestSignal | undefined {
