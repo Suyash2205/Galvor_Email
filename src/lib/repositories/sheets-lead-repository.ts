@@ -7,6 +7,11 @@ import { getSheetsClient, getSpreadsheetId } from "@/lib/sheets/client";
 import { env } from "@/lib/system/env";
 
 type Row = Record<string, string>;
+interface SheetData {
+  headers: string[];
+  rows: Row[];
+  headerRowNumber: number;
+}
 
 const trackerTabs = ["Tracker", "Positiv Leads"] as const;
 let schemaEnsuredAt = 0;
@@ -20,7 +25,7 @@ export class SheetsLeadRepository implements LeadRepository {
   async getLeads(filters: LeadFilters): Promise<Lead[]> {
     const [rows, positiveRows] = await this.readRowsMany(["Tracker", "Positiv Leads"]);
     const merged = [...rows, ...positiveRows]
-      .map(rowToLead)
+      .map((row) => rowToLead(row))
       .filter((lead): lead is Lead => Boolean(lead))
       .filter((lead) => lead.connectedInbox.toLowerCase() === filters.connectedInbox.toLowerCase())
       .filter((lead) => !filters.stage || lead.overallStage === filters.stage)
@@ -52,7 +57,15 @@ export class SheetsLeadRepository implements LeadRepository {
     emailAddress: string,
     connectedInbox: string,
   ): Promise<Lead | null> {
-    const leads = await this.getLeads({ connectedInbox });
+    const [trackerRows, positiveRows] = await this.readRowsMany(["Tracker", "Positiv Leads"]);
+    const leads = [...trackerRows, ...positiveRows]
+      .map((row) => rowToLead(row, connectedInbox))
+      .filter((lead): lead is Lead => Boolean(lead))
+      .filter(
+        (lead) =>
+          !lead.connectedInbox ||
+          lead.connectedInbox.toLowerCase() === connectedInbox.toLowerCase(),
+      );
     return (
       leads.find(
         (lead) =>
@@ -84,7 +97,7 @@ export class SheetsLeadRepository implements LeadRepository {
         "Sync Source": "dashboard",
       };
 
-      await this.writeRow(tab, rowIndex + 2, sheet.headers, nextRow);
+      await this.writeRow(tab, sheet.headerRowNumber + 1 + rowIndex, sheet.headers, nextRow);
       return rowToLead(nextRow);
     }
 
@@ -94,14 +107,25 @@ export class SheetsLeadRepository implements LeadRepository {
   async upsertLead(lead: Lead): Promise<void> {
     await this.ensureSchema();
     const sheet = await this.getSheet("Tracker");
-    const rowIndex = sheet.rows.findIndex((row) => row["Lead ID"] === lead.id);
+    const rowIndex = sheet.rows.findIndex(
+      (row) =>
+        row["Lead ID"] === lead.id ||
+        row["Gmail Thread ID"] === lead.gmailThreadId ||
+        readCell(row, "Email Address").toLowerCase() === lead.emailAddress.toLowerCase(),
+    );
     const row = leadToRow(lead);
     if (rowIndex >= 0) {
-      await this.writeRow("Tracker", rowIndex + 2, sheet.headers, row);
+      await this.writeRow(
+        "Tracker",
+        sheet.headerRowNumber + 1 + rowIndex,
+        sheet.headers,
+        { ...sheet.rows[rowIndex], ...row },
+      );
       return;
     }
 
-    await this.appendRow("Tracker", sheet.headers, row);
+    const positiveSheet = await this.getSheet("Positiv Leads");
+    await this.appendRow("Positiv Leads", positiveSheet.headers, row);
   }
 
   async getThreadMessages(leadId: string, connectedInbox: string): Promise<EmailMessage[]> {
@@ -124,7 +148,12 @@ export class SheetsLeadRepository implements LeadRepository {
         (item) => item["Gmail Message ID"] === message.gmailMessageId,
       );
       if (rowIndex >= 0) {
-        await this.writeRow("Email Threads", rowIndex + 2, sheet.headers, row);
+        await this.writeRow(
+          "Email Threads",
+          sheet.headerRowNumber + 1 + rowIndex,
+          sheet.headers,
+          row,
+        );
       } else {
         await this.appendRow("Email Threads", sheet.headers, row);
       }
@@ -162,7 +191,7 @@ export class SheetsLeadRepository implements LeadRepository {
         item["Gmail Account Email"].toLowerCase() === state.gmailAccount.toLowerCase(),
     );
     if (rowIndex >= 0) {
-      await this.writeRow("_System", rowIndex + 2, sheet.headers, row);
+      await this.writeRow("_System", sheet.headerRowNumber + 1 + rowIndex, sheet.headers, row);
       return;
     }
     await this.appendRow("_System", sheet.headers, row);
@@ -212,23 +241,24 @@ export class SheetsLeadRepository implements LeadRepository {
   }
 
   private async ensureColumns(tab: string, requiredColumns: readonly string[]) {
-    const headers = await this.readHeaders(tab);
+    const { headers, headerRowNumber } = await this.readHeaders(tab);
     if (headers.length === 0) {
       await this.updateRange(`${quoteTab(tab)}!A1`, [[...requiredColumns]]);
       return;
     }
 
-    const missing = requiredColumns.filter((column) => !headers.includes(column));
+    const missing = requiredColumns.filter((column) => !hasEquivalentHeader(headers, column));
     if (missing.length === 0) return;
 
-    await this.updateRange(`${quoteTab(tab)}!A1`, [[...headers, ...missing]]);
+    await this.updateRange(`${quoteTab(tab)}!A${headerRowNumber}`, [[...headers, ...missing]]);
   }
 
-  private async getSheet(tab: string) {
+  private async getSheet(tab: string): Promise<SheetData> {
     const values = await this.readValues(tab);
-    const headers = values[0] ?? [];
-    const rows = values.slice(1).map((cells) => cellsToRow(headers, cells));
-    return { headers, rows };
+    const headerRowIndex = findHeaderRowIndex(values);
+    const headers = values[headerRowIndex] ?? [];
+    const rows = values.slice(headerRowIndex + 1).map((cells) => cellsToRow(headers, cells));
+    return { headers, rows, headerRowNumber: headerRowIndex + 1 };
   }
 
   private async readRows(tab: string): Promise<Row[]> {
@@ -244,14 +274,16 @@ export class SheetsLeadRepository implements LeadRepository {
 
     return tabs.map((_, index) => {
       const values = (response.data.valueRanges?.[index]?.values as string[][] | undefined) ?? [];
-      const headers = values[0] ?? [];
-      return values.slice(1).map((cells) => cellsToRow(headers, cells));
+      const headerRowIndex = findHeaderRowIndex(values);
+      const headers = values[headerRowIndex] ?? [];
+      return values.slice(headerRowIndex + 1).map((cells) => cellsToRow(headers, cells));
     });
   }
 
-  private async readHeaders(tab: string): Promise<string[]> {
+  private async readHeaders(tab: string): Promise<{ headers: string[]; headerRowNumber: number }> {
     const values = await this.readValues(tab);
-    return values[0] ?? [];
+    const headerRowIndex = findHeaderRowIndex(values);
+    return { headers: values[headerRowIndex] ?? [], headerRowNumber: headerRowIndex + 1 };
   }
 
   private async readValues(tab: string): Promise<string[][]> {
@@ -292,6 +324,7 @@ export function leadToRow(lead: Lead): Row {
   return {
     "Lead ID": lead.id || randomUUID(),
     "Company/Brand": lead.company,
+    "Company / Brand": lead.company,
     Category: lead.category ?? "",
     "First Name": lead.firstName ?? "",
     "Last Name": lead.lastName ?? "",
@@ -322,40 +355,40 @@ export function leadToRow(lead: Lead): Row {
   };
 }
 
-function rowToLead(row: Row): Lead | null {
-  const emailAddress = row["Email Address"];
-  const connectedInbox = row["Connected Inbox"];
+function rowToLead(row: Row, fallbackConnectedInbox = ""): Lead | null {
+  const emailAddress = readCell(row, "Email Address");
+  const connectedInbox = readCell(row, "Connected Inbox") || fallbackConnectedInbox;
   if (!emailAddress || !connectedInbox) return null;
   return {
-    id: row["Lead ID"] || randomUUID(),
-    company: row["Company/Brand"] || row.Company || emailAddress,
-    category: row.Category,
-    firstName: row["First Name"],
-    lastName: row["Last Name"],
+    id: readCell(row, "Lead ID") || randomUUID(),
+    company: readCell(row, "Company/Brand") || readCell(row, "Company") || emailAddress,
+    category: readCell(row, "Category"),
+    firstName: readCell(row, "First Name"),
+    lastName: readCell(row, "Last Name"),
     emailAddress,
-    phoneNumber: row["Phone Number"],
-    owner: row.Owner,
+    phoneNumber: readCell(row, "Phone Number"),
+    owner: readCell(row, "Owner"),
     connectedInbox,
-    gmailThreadId: row["Gmail Thread ID"],
-    emailSubject: row["Email Subject"],
-    firstReplyDate: row["First Reply Date"],
-    lastReplyFrom: row["Last Reply From"],
-    lastReplySnippet: row["Last Reply Snippet"],
-    threadMessageCount: Number(row["Thread Message Count"] || 0),
-    emailSummary: row["Email Summary"],
-    interestSignal: parseInterestSignal(row["Interest Signal"]),
-    suggestedNextStep: row["Suggested Next Step"],
-    emailStatus: row["Email Status"],
-    emailOutcome: row["Email Outcome"],
-    emailNotes: row["Email Notes"],
-    nextAction: row["Next Action"],
-    nextActionDate: row["Next Action Date"],
-    overallStage: row["Overall Stage"],
-    priority: row.Priority,
-    lastTouchDate: row["Last Touch Date"],
-    dashboardUrl: row["Dashboard URL"],
-    lastSyncedAt: row["Last Synced At"],
-    syncSource: parseSyncSource(row["Sync Source"]),
+    gmailThreadId: readCell(row, "Gmail Thread ID"),
+    emailSubject: readCell(row, "Email Subject"),
+    firstReplyDate: readCell(row, "First Reply Date"),
+    lastReplyFrom: readCell(row, "Last Reply From"),
+    lastReplySnippet: readCell(row, "Last Reply Snippet"),
+    threadMessageCount: Number(readCell(row, "Thread Message Count") || 0),
+    emailSummary: readCell(row, "Email Summary"),
+    interestSignal: parseInterestSignal(readCell(row, "Interest Signal")),
+    suggestedNextStep: readCell(row, "Suggested Next Step"),
+    emailStatus: readCell(row, "Email Status"),
+    emailOutcome: readCell(row, "Email Outcome"),
+    emailNotes: readCell(row, "Email Notes"),
+    nextAction: readCell(row, "Next Action"),
+    nextActionDate: readCell(row, "Next Action Date"),
+    overallStage: readCell(row, "Overall Stage"),
+    priority: readCell(row, "Priority"),
+    lastTouchDate: readCell(row, "Last Touch Date"),
+    dashboardUrl: readCell(row, "Dashboard URL"),
+    lastSyncedAt: readCell(row, "Last Synced At"),
+    syncSource: parseSyncSource(readCell(row, "Sync Source")),
   };
 }
 
@@ -410,6 +443,29 @@ function cellsToRow(headers: string[], cells: string[]): Row {
     row[header] = cells[index] ?? "";
     return row;
   }, {});
+}
+
+function readCell(row: Row, canonicalHeader: string) {
+  for (const header of equivalentHeaders(canonicalHeader)) {
+    const value = row[header];
+    if (value) return value;
+  }
+  return "";
+}
+
+function hasEquivalentHeader(headers: string[], canonicalHeader: string) {
+  const equivalents = new Set(equivalentHeaders(canonicalHeader));
+  return headers.some((header) => equivalents.has(header));
+}
+
+function equivalentHeaders(header: string) {
+  if (header === "Company/Brand") return ["Company/Brand", "Company / Brand", "Company"];
+  return [header];
+}
+
+function findHeaderRowIndex(values: string[][]) {
+  const index = values.findIndex((row) => row.includes("Email Address"));
+  return index >= 0 ? index : 0;
 }
 
 function parseInterestSignal(value?: string): Lead["interestSignal"] {

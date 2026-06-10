@@ -9,8 +9,9 @@ import { getLeadRepository } from "@/lib/repositories";
 import type { EmailMessage, Lead } from "@/lib/repositories/types";
 import { env } from "@/lib/system/env";
 
-const backfillQuery = "newer_than:90d -from:(me)";
-const maxThreadsPerRun = 50;
+const backfillQuery = "newer_than:180d";
+const maxThreadsPerRun = 200;
+const maxSummariesPerRun = 8;
 
 export interface GmailSyncResult {
   gmailAccount: string;
@@ -60,15 +61,18 @@ export async function syncGmailAccount(gmailAccount: string): Promise<GmailSyncR
       const parsed = parseGmailThread(gmailThread.data, gmailAccount);
       if (!parsed || !isLeadThread(parsed.messages, [gmailAccount])) continue;
 
-      leadThreads += 1;
       const externalContact = getPrimaryExternalContact(parsed.messages, gmailAccount);
       if (!externalContact) continue;
+      const hasOutbound = parsed.messages.some((message) => message.direction === "outbound");
+      if (!hasOutbound) continue;
 
       const existing = await repository.findLeadForGmailThread(
         parsed.gmailThreadId,
         externalContact.email,
         gmailAccount,
       );
+
+      leadThreads += 1;
       const leadId = existing?.id ?? randomUUID();
       const messages = parsed.messages.map((message) => ({ ...message, leadId }));
       const latestInbound = [...messages].reverse().find((message) => message.direction === "inbound");
@@ -77,9 +81,14 @@ export async function syncGmailAccount(gmailAccount: string): Promise<GmailSyncR
       await repository.upsertThreadMessages(messages);
       upsertedMessages += messages.length;
 
-      await throttleGemini();
-      const summary = await summarizeThread(parsed.subject, messages);
-      summarizedThreads += 1;
+      const summary =
+        summarizedThreads < maxSummariesPerRun
+          ? await summarizeWithThrottle(parsed.subject, messages)
+          : {
+              ...buildUnsummarizedPlaceholder(messages),
+              source: "fallback" as const,
+            };
+      if (summarizedThreads < maxSummariesPerRun) summarizedThreads += 1;
 
       const lead: Lead = {
         id: leadId,
@@ -169,6 +178,23 @@ async function listThreadIds(gmail: gmail_v1.Gmail) {
   }
 
   return ids;
+}
+
+async function summarizeWithThrottle(subject: string, messages: EmailMessage[]) {
+  await throttleGemini();
+  return summarizeThread(subject, messages);
+}
+
+function buildUnsummarizedPlaceholder(messages: EmailMessage[]) {
+  const latestInbound = [...messages].reverse().find((message) => message.direction === "inbound");
+  return {
+    summary:
+      latestInbound?.snippet ||
+      latestInbound?.bodyText?.slice(0, 200) ||
+      "Imported from Gmail. Summary pending.",
+    interestSignal: "Neutral" as const,
+    suggestedNextStep: "Review the thread and decide the next follow-up.",
+  };
 }
 
 function parseGmailThread(thread: gmail_v1.Schema$Thread, gmailAccount: string) {
