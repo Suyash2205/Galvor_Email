@@ -11,10 +11,18 @@ export function GmailSyncButton() {
     setSyncing(true);
     setStatus("");
     const response = await fetch("/api/gmail/sync", { method: "POST" });
-    const data = (await response.json()) as { status?: string; error?: string; leadThreads?: number };
+    const data = (await response.json()) as {
+      status?: string;
+      error?: string;
+      scannedThreads?: number;
+      leadThreads?: number;
+      upsertedMessages?: number;
+    };
     setStatus(
       data.status === "ok"
-        ? `Synced ${data.leadThreads ?? 0} replied threads.`
+        ? `Scanned ${data.scannedThreads ?? 0}, imported ${data.leadThreads ?? 0} leads, wrote ${
+            data.upsertedMessages ?? 0
+          } messages.`
         : data.error || "Sync did not complete.",
     );
     setSyncing(false);

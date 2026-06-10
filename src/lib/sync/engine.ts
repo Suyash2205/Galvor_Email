@@ -4,13 +4,18 @@ import { decryptToken } from "@/lib/crypto/tokens";
 import { throttleGemini } from "@/lib/gemini/rate-limiter";
 import { summarizeThread } from "@/lib/gemini/summarize";
 import { getGmailClient } from "@/lib/gmail/client";
-import { directionFor, isAutomatedSender, isLeadThread } from "@/lib/gmail/lead-detector";
+import {
+  directionFor,
+  isAutomatedSender,
+  isLeadThread,
+  isLikelyMarketingThread,
+} from "@/lib/gmail/lead-detector";
 import { getLeadRepository } from "@/lib/repositories";
 import type { EmailMessage, Lead } from "@/lib/repositories/types";
 import { env } from "@/lib/system/env";
 
 const backfillQuery = "newer_than:180d";
-const maxThreadsPerRun = 200;
+const maxThreadsPerRun = 350;
 const maxSummariesPerRun = 8;
 
 export interface GmailSyncResult {
@@ -60,11 +65,10 @@ export async function syncGmailAccount(gmailAccount: string): Promise<GmailSyncR
       });
       const parsed = parseGmailThread(gmailThread.data, gmailAccount);
       if (!parsed || !isLeadThread(parsed.messages, [gmailAccount])) continue;
+      if (isLikelyMarketingThread(parsed.subject, parsed.messages)) continue;
 
       const externalContact = getPrimaryExternalContact(parsed.messages, gmailAccount);
       if (!externalContact) continue;
-      const hasOutbound = parsed.messages.some((message) => message.direction === "outbound");
-      if (!hasOutbound) continue;
 
       const existing = await repository.findLeadForGmailThread(
         parsed.gmailThreadId,
