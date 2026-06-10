@@ -40,16 +40,23 @@ export function isAutomatedSender(from: string) {
 export function isLikelyMarketingThread(subject: string, messages: EmailMessage[]) {
   const normalizedSubject = subject.toLowerCase();
   if (
-    normalizedSubject.includes("unsubscribe") ||
     normalizedSubject.includes("newsletter") ||
-    normalizedSubject.includes("verify your email")
+    normalizedSubject.includes("verify your email") ||
+    normalizedSubject.includes("confirm your subscription")
   ) {
     return true;
   }
 
-  return messages.some((message) => {
-    const text = `${message.bodyText} ${message.snippet}`.toLowerCase();
-    return text.includes("unsubscribe") && text.includes("manage preferences");
+  return messages.every((message) => isAutomatedSender(message.from));
+}
+
+export function isClearlyNegativeThread(messages: EmailMessage[], connectedInboxes: string[]) {
+  const inboundMessages = messages.filter((message) => isExternalInbound(message, connectedInboxes));
+  if (inboundMessages.length === 0) return false;
+
+  return inboundMessages.every((message) => {
+    const text = normalizeReplyText(message.bodyText || message.snippet);
+    return hardNegativePatterns.some((pattern) => pattern.test(text));
   });
 }
 
@@ -57,3 +64,22 @@ function extractEmail(value: string) {
   const match = value.match(/<([^>]+)>/);
   return match?.[1] ?? value;
 }
+
+function normalizeReplyText(value: string) {
+  return value
+    .toLowerCase()
+    .split(/\nOn .+ wrote:|\nFrom:|\nSent:|\n> /i)[0]
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const hardNegativePatterns = [
+  /\bnot interested\b/,
+  /\bno interest\b/,
+  /\bplease remove\b/,
+  /\bremove me\b/,
+  /\bstop emailing\b/,
+  /\bdon't email\b/,
+  /\bdo not email\b/,
+  /\bunsubscribe\b/,
+];

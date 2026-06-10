@@ -6,6 +6,7 @@ import { summarizeThread } from "@/lib/gemini/summarize";
 import { getGmailClient } from "@/lib/gmail/client";
 import {
   directionFor,
+  isClearlyNegativeThread,
   isAutomatedSender,
   isLeadThread,
   isLikelyMarketingThread,
@@ -66,6 +67,7 @@ export async function syncGmailAccount(gmailAccount: string): Promise<GmailSyncR
       const parsed = parseGmailThread(gmailThread.data, gmailAccount);
       if (!parsed || !isLeadThread(parsed.messages, [gmailAccount])) continue;
       if (isLikelyMarketingThread(parsed.subject, parsed.messages)) continue;
+      if (isClearlyNegativeThread(parsed.messages, [gmailAccount])) continue;
 
       const externalContact = getPrimaryExternalContact(parsed.messages, gmailAccount);
       if (!externalContact) continue;
